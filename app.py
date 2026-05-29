@@ -1,114 +1,141 @@
 from flask import Flask, jsonify
+from flask_cors import CORS
 import requests
 import pandas as pd
+import ta
 
 app = Flask(__name__)
+CORS(app)
 
-API_KEY = "demo"
-SYMBOL = "EUR/USD"
+SYMBOL = "EURUSD=X"
 
-def get_data():
-    url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1min&apikey={API_KEY}&outputsize=100"
+def get_market_data():
 
-    response = requests.get(url)
-    data = response.json()
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}?interval=1m&range=1d"
 
-    candles = data["values"]
+    data = requests.get(url).json()
 
-    df = pd.DataFrame(candles)
-    df = df.iloc[::-1]
+    result = data["chart"]["result"][0]
 
-    df["open"] = df["open"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
+    closes = result["indicators"]["quote"][0]["close"]
+    highs = result["indicators"]["quote"][0]["high"]
+    lows = result["indicators"]["quote"][0]["low"]
+
+    df = pd.DataFrame({
+        "close": closes,
+        "high": highs,
+        "low": lows
+    })
+
+    df.dropna(inplace=True)
 
     return df
 
-def analyze_market():
+@app.route("/signal")
+def signal():
 
-    df = get_data()
+    df = get_market_data()
 
     close = df["close"]
 
-    ema9 = close.ewm(span=9).mean()
-    ema21 = close.ewm(span=21).mean()
+    current_price = round(close.iloc[-1], 5)
 
-    delta = close.diff()
+    # RSI
+    rsi = ta.momentum.RSIIndicator(close).rsi().iloc[-1]
 
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    # EMA
+    ema_fast = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
+    ema_slow = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
 
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+    # SUPPORT / RESISTANCE
+    support = round(df["low"].tail(20).min(),5)
+    resistance = round(df["high"].tail(20).max(),5)
 
-    latest_rsi = rsi.iloc[-1]
+    # BREAKOUT
+    breakout_up = current_price > resistance
+    breakout_down = current_price < support
 
-    last = df.iloc[-1]
+    # CANDLE PSYCHOLOGY
+    last_candle = close.iloc[-1]
+    prev_candle = close.iloc[-2]
 
-    body = abs(last["close"] - last["open"])
+    bullish_candle = last_candle > prev_candle
+    bearish_candle = last_candle < prev_candle
 
-    bullish = last["close"] > last["open"]
-    bearish = last["close"] < last["open"]
+    # ENGULFING
+    bullish_engulf = (
+        close.iloc[-1] > close.iloc[-2]
+        and close.iloc[-2] < close.iloc[-3]
+    )
 
-    resistance = df["high"].tail(20).max()
-    support = df["low"].tail(20).min()
-
-    price = last["close"]
+    bearish_engulf = (
+        close.iloc[-1] < close.iloc[-2]
+        and close.iloc[-2] > close.iloc[-3]
+    )
 
     call_score = 0
     put_score = 0
 
-    # EMA
-    if ema9.iloc[-1] > ema21.iloc[-1]:
-        call_score += 2
+    # RSI LOGIC
+    if rsi < 35:
+        call_score += 20
+
+    if rsi > 65:
+        put_score += 20
+
+    # EMA TREND
+    if ema_fast > ema_slow:
+        call_score += 25
     else:
-        put_score += 2
+        put_score += 25
 
-    # RSI
-    if latest_rsi > 55:
-        call_score += 2
+    # CANDLE PSYCHOLOGY
+    if bullish_candle:
+        call_score += 15
 
-    if latest_rsi < 45:
-        put_score += 2
+    if bearish_candle:
+        put_score += 15
 
-    # Candle psychology
-    if bullish and body > 0.0001:
-        call_score += 2
+    # ENGULFING
+    if bullish_engulf:
+        call_score += 20
 
-    if bearish and body > 0.0001:
-        put_score += 2
+    if bearish_engulf:
+        put_score += 20
 
-    # Breakout
-    if price >= resistance:
-        call_score += 3
+    # BREAKOUT
+    if breakout_up:
+        call_score += 20
 
-    if price <= support:
-        put_score += 3
+    if breakout_down:
+        put_score += 20
 
     signal = "WAIT"
 
-    if call_score > put_score:
+    if call_score >= 60:
         signal = "CALL"
 
-    if put_score > call_score:
+    if put_score >= 60:
         signal = "PUT"
 
-    return {
+    accuracy = max(call_score, put_score)
+
+    return jsonify({
         "signal": signal,
-        "price": price,
-        "rsi": round(latest_rsi,2),
+        "price": current_price,
+        "rsi": round(rsi,2),
+        "ema_fast": round(ema_fast,5),
+        "ema_slow": round(ema_slow,5),
+        "support": support,
+        "resistance": resistance,
         "call_score": call_score,
-        "put_score": put_score
-    }
-
-@app.route("/signal")
-def signal():
-    return jsonify(analyze_market())
-
-@app.route("/")
-def home():
-    return "ABHI REAL SIGNAL ENGINE RUNNING"
+        "put_score": put_score,
+        "accuracy": accuracy,
+        "bullish_engulfing": bullish_engulf,
+        "bearish_engulfing": bearish_engulf,
+        "breakout_up": breakout_up,
+        "breakout_down": breakout_down
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
